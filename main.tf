@@ -19,6 +19,16 @@ data "aws_ssm_parameter" "ecs_optimized_ami" {
   name = "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended"
 }
 
+data "template_file" "this" {
+  template = <<-EOT
+    #!/bin/bash
+    cat <<'EOF' >> /etc/ecs/ecs.config
+    ECS_CLUSTER=${var.name}
+    ECS_LOGLEVEL=debug
+    EOF
+  EOT
+}
+
 module "autoscaling" {
   source  = "terraform-aws-modules/autoscaling/aws"
   version = "~> 6.5"
@@ -30,6 +40,8 @@ module "autoscaling" {
 
   security_groups                 = [module.autoscaling_sg.security_group_id]
   ignore_desired_capacity_changes = true
+  user_data                       = base64encode(data.template_file.this.rendered)
+  key_name                        = try(var.key_name, null)
 
   create_iam_instance_profile = true
 
@@ -43,10 +55,14 @@ module "autoscaling" {
   vpc_zone_identifier = module.vpc.public_subnets
   health_check_type   = "EC2"
   min_size            = 0
-  max_size            = 2
+  max_size            = 1
   desired_capacity    = 1
 
-  tags = var.tags
+  tags = merge(var.tags, {
+    key                 = "AmazonECSManaged"
+    value               = true
+    propagate_at_launch = true
+  })
 }
 
 module "autoscaling_sg" {
@@ -65,21 +81,84 @@ module "autoscaling_sg" {
   tags = var.tags
 }
 
+resource "aws_cloudwatch_log_group" "this" {
+  name = var.name
+}
+
 resource "aws_ecs_cluster" "this" {
   name = var.name
+
+  configuration {
+    execute_command_configuration {
+      logging = "OVERRIDE"
+
+      log_configuration {
+        cloud_watch_log_group_name = aws_cloudwatch_log_group.this.name
+      }
+    }
+  }
 }
 
 resource "aws_ecs_capacity_provider" "this" {
   name = var.name
 
   auto_scaling_group_provider {
-    auto_scaling_group_arn         = module.autoscaling.autoscaling_group_arn
-
-    managed_scaling {
-      maximum_scaling_step_size = 1000
-      minimum_scaling_step_size = 1
-      status                    = "ENABLED"
-      target_capacity           = 10
-    }
+    auto_scaling_group_arn = module.autoscaling.autoscaling_group_arn
   }
+}
+
+resource "aws_ecs_cluster_capacity_providers" "example" {
+  cluster_name = aws_ecs_cluster.this.name
+
+  capacity_providers = [aws_ecs_capacity_provider.this.name]
+
+  default_capacity_provider_strategy {
+    base              = 1
+    weight            = 100
+    capacity_provider = aws_ecs_capacity_provider.this.name
+  }
+}
+
+
+resource "aws_ecs_task_definition" "this" {
+  family = "service"
+  container_definitions = jsonencode([
+    {
+      name      = "laravel-nginx"
+      image     = "corbosman/laravel-nginx-php"
+      cpu       = 10
+      memory    = 512
+      essential = true
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+        }
+      ],
+      logConfiguration = {
+        logDriver = "awslogs",
+        options = {
+          "awslogs-region"        = "eu-west-1",
+          "awslogs-group"         = "${aws_cloudwatch_log_group.this.name}",
+          "awslogs-stream-prefix" = "ec2"
+        }
+      }
+    }
+  ])
+
+  placement_constraints {
+    type       = "memberOf"
+    expression = "attribute:ecs.availability-zone in [us-west-2a, us-west-2b]"
+  }
+}
+
+resource "aws_ecs_service" "this" {
+  name            = var.name
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.this.arn
+
+  desired_count = 1
+
+  deployment_maximum_percent         = 100
+  deployment_minimum_healthy_percent = 0
 }
