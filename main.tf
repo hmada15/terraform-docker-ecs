@@ -1,17 +1,6 @@
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 3.0"
-
-  name = var.name
-
-  cidr = "10.0.0.0/16"
-
-  azs            = ["${data.aws_region.current.name}a", "${data.aws_region.current.name}b", "${data.aws_region.current.name}c"]
-  public_subnets = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
-
-  enable_dns_hostnames = true
-
-  tags = var.tags
+module "network" {
+  source = "./network"
+  name   = var.name
 }
 
 module "autoscaling" {
